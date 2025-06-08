@@ -74,13 +74,38 @@ class Quantize(nn.Module):
             embed_ind (Tensor): The indices of the closest embeddings in the codebook.
         """
         # Reshape the input to be a 2D tensor of shape (B*H*W, C) or (B*N, C)
+        # So everything in dim 0 is basically a patch
         flatten = input.reshape(-1, self.dim)
-        # Calculate the L2 distance between each input vector and each embedding vector.
+
+        #   B*N = number of vectors in the batch
+        #   C = number of channels for each latent vector (e.g., 64)
+        #   E = number of embeddings in the codebook (e.g., 512)
+
+        # This entire block calculates the squared Euclidean distance: ||a - b||² = a² - 2ab + b²
+        # where 'a' is 'flatten' and 'b' is 'self.embed'.
         dist = (
-            flatten.pow(2).sum(1, keepdim=True)
-            - 2 * flatten @ self.embed
-            + self.embed.pow(2).sum(0, keepdim=True)
+            # --- Term 1: a² ---
+            # `flatten.pow(2)` -> shape [B*N, C]
+            # `.sum(1, keepdim=True)` sums along the channel dimension C.
+            # Resulting shape: [B*N, 1]
+                flatten.pow(2).sum(1, keepdim=True)
+
+                # --- Term 2: -2ab ---
+                # This is the matrix multiplication of flatten and the codebook.
+                # `flatten @ self.embed` -> [B*N, C] @ [C, E]
+                # Resulting shape: [B*N, E]
+                - 2 * flatten @ self.embed
+
+                # --- Term 3: b² ---
+                # `self.embed.pow(2)` -> shape [C, E]
+                # `.sum(0, keepdim=True)` sums along the channel dimension C.
+                # Resulting shape: [1, E]
+                + self.embed.pow(2).sum(0, keepdim=True)
         )
+        # --- Final Output ---
+        # Returned is the distance between each vector in the batch and each embedding in the codebook.
+        # `dist` shape: [B*N, E]
+
         # Find the index of the closest embedding for each input vector.
         _, embed_ind = (-dist).max(1)
         # Create a one-hot encoding of the embedding indices.
