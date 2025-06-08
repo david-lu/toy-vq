@@ -111,7 +111,7 @@ def train(epoch, loader, model, optimizer, scheduler, device):
                     f"sample/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}.png",
                     nrow=sample_size,
                     normalize=True,
-                    range=(-1, 1), # Normalize the image pixel values for saving.
+                    value_range=(-1, 1), # Normalize the image pixel values for saving.
                 )
 
                 # Set the model back to training mode.
