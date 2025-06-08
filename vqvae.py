@@ -108,12 +108,25 @@ class Quantize(nn.Module):
 
         # Find the index of the closest embedding for each input vector.
         _, embed_ind = (-dist).max(1)
+        # `embed_ind` shape: [B*N]
+        #   - A 1D tensor containing the index of the closest codebook vector for each of the N input vectors.
+
         # Create a one-hot encoding of the embedding indices.
         embed_onehot = F.one_hot(embed_ind, self.n_embed).type(flatten.dtype)
+        # `embed_onehot` shape: [B*N, E]
+        #   - Each index is converted into a one-hot vector of length E.
+
         # Reshape the embedding indices to the spatial dimensions of the input.
         embed_ind = embed_ind.view(*input.shape[:-1])
+        # `embed_ind` shape (reshaped): [B, H', W']
+        #   - The flat list of N indices is reshaped into a spatially ordered map,
+        #     preserving the batch and spatial structure.
+
         # Get the quantized vectors from the codebook using the indices.
         quantize = self.embed_code(embed_ind)
+        # `quantize` shape: [B, H', W', C]
+        #   - Each index in the [B, H', W'] map is replaced by its corresponding C-dimensional
+        #     vector from the codebook, resulting in the final quantized latent map.
 
         # During training, update the codebook embeddings.
         if self.training:
@@ -166,24 +179,48 @@ class Quantize(nn.Module):
 class ResBlock(nn.Module):
     """
     ## Residual Block
-    This is a standard residual block (ResBlock). Its purpose is to help build
-    deeper and more powerful encoder and decoder networks. By adding its input
-    to its output (a "skip connection"), it helps prevent the vanishing gradient
-    problem, making it easier to train the overall model.
+    This is a standard residual block (ResBlock). Its core idea is to learn a
+    residual function F(x) and add its result back to the original input x.
+    The final output is H(x) = F(x) + x.
+
+    This structure, known as a "skip connection" or "identity shortcut," helps
+    in training very deep networks by preventing the vanishing gradient problem
+    and making it easier for layers to learn an identity mapping if needed.
+
+    The convolutions inside this block are responsible for implementing F(x).
+    They learn to refine the features from the input tensor.
     """
     def __init__(self, in_channel, channel):
         """
         Initializes the ResBlock.
         Args:
-            in_channel (int): Number of input channels.
-            channel (int): Number of channels in the hidden convolutional layer.
+            in_channel (int): Number of input and output channels for the block.
+            channel (int): Number of channels for the internal hidden layer.
         """
         super().__init__()
 
+        # The `self.conv` sequence defines the residual function F(x).
+        # It's a series of layers that transform the input to produce a "change" or "delta".
+        # Convolutions are used because they are excellent at processing spatial data (like feature maps)
+        # and learning hierarchies of patterns (edges, textures, etc.).
         self.conv = nn.Sequential(
+            # First, apply a non-linear activation. This is a "pre-activation" design.
             nn.ReLU(),
+
+            # The first convolution is the main feature-learning step.
+            # It uses a 3x3 kernel to process a local neighborhood of the feature map.
+            # It expands the number of channels from `in_channel` to `channel`, creating
+            # a richer feature space for the block to work with.
             nn.Conv2d(in_channel, channel, 3, padding=1),
+
+            # Apply another non-linear activation.
             nn.ReLU(inplace=True),
+
+            # The second convolution is a 1x1 "projection" layer.
+            # A 1x1 convolution acts like a per-pixel fully connected layer across channels.
+            # Its crucial job here is to project the feature map from `channel` back down
+            # to `in_channel`, ensuring its output shape matches the original input's shape
+            # so they can be added together.
             nn.Conv2d(channel, in_channel, 1),
         )
 
@@ -191,12 +228,16 @@ class ResBlock(nn.Module):
         """
         Forward pass of the residual block.
         Args:
-            input (Tensor): The input tensor.
+            input (Tensor): The input tensor, x.
         Returns:
-            out (Tensor): The output tensor.
+            out (Tensor): The output tensor, H(x) = F(x) + x.
         """
+        # Calculate the residual, F(x), by passing the input through the convolutional path.
         out = self.conv(input)
-        # The output of the convolutional layers is added to the original input.
+
+        # This is the residual connection (the "+ x" part).
+        # The output of the convolutional layers (the residual) is added element-wise
+        # to the original input.
         out += input
 
         return out
@@ -205,45 +246,68 @@ class ResBlock(nn.Module):
 class Encoder(nn.Module):
     """
     ## Encoder Network
-    The Encoder's job is to take an input, like an image, and compress it.
-    It uses a series of convolutional and residual blocks to downsample the
-    input into a smaller, lower-resolution feature map. This compressed
-    feature map is the continuous latent representation that will be fed into
-    the Quantize layer.
+    The Encoder's job is to take a high-dimensional input (like an image) and
+    compress it into a lower-dimensional spatial representation (a feature map).
+    It achieves this by using a series of strided convolutions to downsample the
+    input, while simultaneously increasing the number of channels to capture more
+    complex features. The ResBlocks are used to build a deeper and more powerful
+    network, allowing for more sophisticated feature extraction at each spatial level.
     """
+
     def __init__(self, in_channel, channel, n_res_block, n_res_channel, stride):
         """
         Initializes the Encoder.
         Args:
             in_channel (int): Number of input channels (e.g., 3 for an RGB image).
-            channel (int): Number of channels in the main convolutional layers.
-            n_res_block (int): Number of residual blocks.
-            n_res_channel (int): Number of channels in the residual blocks' hidden layers.
-            stride (int): The stride of the convolutional layers, controlling the downsampling factor.
+            channel (int): Number of output channels for the main convolutions.
+            n_res_block (int): Number of residual blocks to use.
+            n_res_channel (int): Number of channels in the hidden layers of the ResBlocks.
+            stride (int): The total downsampling factor (e.g., 4 or 2).
         """
         super().__init__()
 
-        # These blocks are for downsampling the input.
+        blocks = []
+
         if stride == 4:
-            blocks = [
+            # This configuration downsamples the input by a total factor of 4.
+            # Initial shape: [B, in_channel, H, W]
+            blocks.extend([
+                # First downsampling layer: Halves spatial dimensions.
+                # Shape: [B, in_channel, H, W] -> [B, channel // 2, H/2, W/2]
                 nn.Conv2d(in_channel, channel // 2, 4, stride=2, padding=1),
                 nn.ReLU(inplace=True),
+
+                # Second downsampling layer: Halves spatial dimensions again.
+                # Shape: [B, channel // 2, H/2, W/2] -> [B, channel, H/4, W/4]
                 nn.Conv2d(channel // 2, channel, 4, stride=2, padding=1),
                 nn.ReLU(inplace=True),
+
+                # A 3x3 convolution to refine features without changing dimensions.
+                # Shape: [B, channel, H/4, W/4] -> [B, channel, H/4, W/4]
                 nn.Conv2d(channel, channel, 3, padding=1),
-            ]
+            ])
 
         elif stride == 2:
-            blocks = [
+            # This configuration downsamples the input by a factor of 2.
+            # Initial shape: [B, in_channel, H, W]
+            blocks.extend([
+                # Single downsampling layer: Halves spatial dimensions.
+                # Shape: [B, in_channel, H, W] -> [B, channel // 2, H/2, W/2]
                 nn.Conv2d(in_channel, channel // 2, 4, stride=2, padding=1),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(channel // 2, channel, 3, padding=1),
-            ]
 
-        # Add the specified number of residual blocks.
+                # A 3x3 convolution to refine features and adjust channels.
+                # Shape: [B, channel // 2, H/2, W/2] -> [B, channel, H/2, W/2]
+                nn.Conv2d(channel // 2, channel, 3, padding=1),
+            ])
+
+        # Add a series of residual blocks.
+        # These blocks do not change the shape of the tensor.
+        # Shape remains: [B, channel, H_latent, W_latent] throughout the loop.
         for i in range(n_res_block):
             blocks.append(ResBlock(channel, n_res_channel))
 
+        # A final activation function for the entire encoder block. Shape is unchanged.
         blocks.append(nn.ReLU(inplace=True))
 
         self.blocks = nn.Sequential(*blocks)
@@ -252,9 +316,9 @@ class Encoder(nn.Module):
         """
         Forward pass of the Encoder.
         Args:
-            input (Tensor): The input tensor.
+            input (Tensor): Input tensor with shape [B, C_in, H, W].
         Returns:
-            (Tensor): The encoded latent representation.
+            (Tensor): Downsampled latent feature map with shape [B, C, H/stride, W/stride].
         """
         return self.blocks(input)
 
@@ -262,41 +326,55 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     """
     ## Decoder Network
-    The Decoder does the opposite of the Encoder. It takes the discretized,
-    quantized latent representation and upsamples it back to the original
-    input's dimensions. It uses a series of transposed convolutional layers
-    and residual blocks to reconstruct the data (e.g., an image) from the
-    compressed representation.
+    The Decoder's purpose is to perform the inverse operation of the Encoder.
+    It takes a low-dimensional spatial feature map (the quantized latent representation)
+    and upsamples it back to the original input's dimensions (e.g., an image).
+    It uses Transposed Convolutions for upsampling and ResBlocks to refine the
+    features at each spatial level, helping to generate a high-quality reconstruction.
     """
+
     def __init__(
-        self, in_channel, out_channel, channel, n_res_block, n_res_channel, stride
+            self, in_channel, out_channel, channel, n_res_block, n_res_channel, stride
     ):
         """
         Initializes the Decoder.
         Args:
-            in_channel (int): Number of input channels for the decoder (dimension of the latent space).
-            out_channel (int): Number of output channels (e.g., 3 for an RGB image).
-            channel (int): Number of channels in the main convolutional layers.
-            n_res_block (int): Number of residual blocks.
-            n_res_channel (int): Number of channels in the residual blocks' hidden layers.
-            stride (int): The stride of the transposed convolutional layers, controlling the upsampling factor.
+            in_channel (int): Number of channels in the input latent map.
+            out_channel (int): Number of channels in the final output image (e.g., 3 for RGB).
+            channel (int): Number of channels for the main convolutions.
+            n_res_block (int): Number of residual blocks to use.
+            n_res_channel (int): Number of channels in the hidden layers of the ResBlocks.
+            stride (int): The total upsampling factor (e.g., 4 or 2).
         """
         super().__init__()
 
-        blocks = [nn.Conv2d(in_channel, channel, 3, padding=1)]
+        # Initial shape: [B, in_channel, H_latent, W_latent]
+        blocks = [
+            # Initial 3x3 convolution to transform the input latent features.
+            # Shape: [B, in_channel, H_latent, W_latent] -> [B, channel, H_latent, W_latent]
+            nn.Conv2d(in_channel, channel, 3, padding=1)
+        ]
 
-        # Add the specified number of residual blocks.
+        # Add a series of residual blocks to refine features before upsampling.
+        # These blocks do not change the shape of the tensor.
+        # Shape remains: [B, channel, H_latent, W_latent] throughout the loop.
         for i in range(n_res_block):
             blocks.append(ResBlock(channel, n_res_channel))
 
+        # Apply an activation function before upsampling. Shape is unchanged.
         blocks.append(nn.ReLU(inplace=True))
 
-        # These blocks are for upsampling the latent representation.
         if stride == 4:
+            # This configuration upsamples the input by a total factor of 4.
             blocks.extend(
                 [
+                    # First upsampling layer: Doubles spatial dimensions.
+                    # Shape: [B, channel, H, W] -> [B, channel // 2, H*2, W*2]
                     nn.ConvTranspose2d(channel, channel // 2, 4, stride=2, padding=1),
                     nn.ReLU(inplace=True),
+
+                    # Second upsampling layer: Doubles dimensions again to reach the target size.
+                    # Shape: [B, channel // 2, H*2, W*2] -> [B, out_channel, H*4, W*4]
                     nn.ConvTranspose2d(
                         channel // 2, out_channel, 4, stride=2, padding=1
                     ),
@@ -304,6 +382,8 @@ class Decoder(nn.Module):
             )
 
         elif stride == 2:
+            # This configuration upsamples the input by a factor of 2.
+            # Shape: [B, channel, H, W] -> [B, out_channel, H*2, W*2]
             blocks.append(
                 nn.ConvTranspose2d(channel, out_channel, 4, stride=2, padding=1)
             )
@@ -314,9 +394,9 @@ class Decoder(nn.Module):
         """
         Forward pass of the Decoder.
         Args:
-            input (Tensor): The latent representation.
+            input (Tensor): Input tensor (latent map) with shape [B, C_in, H, W].
         Returns:
-            (Tensor): The reconstructed output.
+            (Tensor): Reconstructed output with shape [B, C_out, H*stride, W*stride].
         """
         return self.blocks(input)
 
