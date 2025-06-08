@@ -405,11 +405,11 @@ class VQVAE(nn.Module):
     """
     ## Hierarchical VQ-VAE Model
     This is the main VQ-VAE model that brings all the other components together.
-    It implements a hierarchical structure with two levels (top and bottom) of
-    encoding and quantization. This allows the model to capture both high-level,
-    abstract information (top level) and fine-grained details (bottom level).
-    The class defines the complete forward pass, from encoding the input image
-    to decoding the quantized codes back into a reconstructed image.
+    It implements a hierarchical structure with two levels of quantization (top and bottom).
+    This allows the model to capture both high-level, abstract information (in the
+    smaller, top-level latent map) and fine-grained details (in the larger,
+    bottom-level latent map). This separation of concerns helps in generating
+    high-fidelity images.
     """
     def __init__(
         self,
@@ -424,37 +424,37 @@ class VQVAE(nn.Module):
         """
         Initializes the VQ-VAE model.
         Args:
-            in_channel (int): Number of channels in the input image.
-            channel (int): Number of channels in the main convolutional layers.
+            in_channel (int): C_in, number of channels in the input image.
+            channel (int): C, number of channels in the main convolutional layers.
             n_res_block (int): Number of residual blocks.
             n_res_channel (int): Number of channels in the residual blocks' hidden layers.
-            embed_dim (int): The dimension of the embedding vectors.
+            embed_dim (int): C_emb, the dimension of the embedding vectors.
             n_embed (int): The number of embedding vectors in the codebook.
-            decay (float): The decay factor for the exponential moving average update of the embeddings.
+            decay (float): The decay factor for EMA updates in the Quantize layer.
         """
         super().__init__()
 
         # Bottom-level encoder, which downsamples by a factor of 4.
         self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=4)
-        # Top-level encoder, which downsamples the output of the bottom encoder by a factor of 2.
+        # Top-level encoder, which downsamples the bottom-level features by another 2x.
         self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, stride=2)
-        # Convolutional layer to prepare the top-level latent representation for quantization.
+        # 1x1 Conv to map top-level features to the embedding dimension.
         self.quantize_conv_t = nn.Conv2d(channel, embed_dim, 1)
         # Top-level quantization layer.
         self.quantize_t = Quantize(embed_dim, n_embed)
-        # Top-level decoder to reconstruct the top-level latent representation.
+        # Decoder for the top-level features, upsampling by 2x.
         self.dec_t = Decoder(
             embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2
         )
-        # Convolutional layer to prepare the bottom-level latent representation for quantization.
+        # 1x1 Conv to map the combined bottom and top features to the embedding dimension.
         self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
         # Bottom-level quantization layer.
         self.quantize_b = Quantize(embed_dim, n_embed)
-        # Transposed convolutional layer to upsample the top-level quantized output.
+        # Upsampling layer for the top-level features to match bottom-level dimensions.
         self.upsample_t = nn.ConvTranspose2d(
             embed_dim, embed_dim, 4, stride=2, padding=1
         )
-        # Final decoder to reconstruct the image from the combined quantized representations.
+        # The final decoder that reconstructs the image from the combined latent maps.
         self.dec = Decoder(
             embed_dim + embed_dim,
             in_channel,
@@ -468,10 +468,10 @@ class VQVAE(nn.Module):
         """
         The main forward pass for the VQ-VAE, used during training.
         Args:
-            input (Tensor): The input image tensor.
+            input (Tensor): The input image tensor with shape [B, C_in, H, W].
         Returns:
-            dec (Tensor): The reconstructed image.
-            diff (Tensor): The total commitment loss (sum of top and bottom).
+            dec (Tensor): The reconstructed image with shape [B, C_in, H, W].
+            diff (Tensor): The total commitment loss (scalar).
         """
         # Encode the input to get the quantized representations and commitment loss.
         quant_t, quant_b, diff, _, _ = self.encode(input)
@@ -482,80 +482,76 @@ class VQVAE(nn.Module):
 
     def encode(self, input):
         """
-        Encodes the input image into discrete latent codes.
+        Encodes the input image into discrete latent codes for both hierarchy levels.
         Args:
-            input (Tensor): The input image tensor.
+            input (Tensor): The input image tensor with shape [B, C_in, H, W].
         Returns:
-            quant_t (Tensor): The quantized top-level representation.
-            quant_b (Tensor): The quantized bottom-level representation.
-            diff_t + diff_b (Tensor): The total commitment loss.
-            id_t (Tensor): The top-level discrete codes.
-            id_b (Tensor): The bottom-level discrete codes.
+            quant_t (Tensor): Quantized top-level latent map, shape [B, C_emb, H/8, W/8].
+            quant_b (Tensor): Quantized bottom-level latent map, shape [B, C_emb, H/4, W/4].
+            diff (Tensor): Total commitment loss.
+            id_t (Tensor): Top-level indices, shape [B, H/8, W/8].
+            id_b (Tensor): Bottom-level indices, shape [B, H/4, W/4].
         """
-        # Bottom-level encoding.
-        enc_b = self.enc_b(input)
-        # Top-level encoding.
-        enc_t = self.enc_t(enc_b)
+        # --- Top-Level Encoding ---
+        # Initial shape: [B, C_in, H, W]
+        enc_b = self.enc_b(input) # Shape: [B, C, H/4, W/4]
+        enc_t = self.enc_t(enc_b) # Shape: [B, C, H/8, W/8]
 
-        # Prepare for top-level quantization.
-        quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1)
-        # Top-level quantization.
-        quant_t, diff_t, id_t = self.quantize_t(quant_t)
-        # Permute back to (B, C, H, W).
-        quant_t = quant_t.permute(0, 3, 1, 2)
+        # --- Top-Level Quantization ---
+        quant_t = self.quantize_conv_t(enc_t).permute(0, 2, 3, 1) # Shape: [B, H/8, W/8, C_emb]
+        quant_t, diff_t, id_t = self.quantize_t(quant_t) # quant_t shape: [B, H/8, W/8, C_emb]
+        quant_t = quant_t.permute(0, 3, 1, 2) # Shape: [B, C_emb, H/8, W/8]
         diff_t = diff_t.unsqueeze(0)
 
-        # Decode the top-level quantized representation.
-        dec_t = self.dec_t(quant_t)
-        # Concatenate the decoded top-level representation with the bottom-level encoding.
-        enc_b = torch.cat([dec_t, enc_b], 1)
+        # --- Bottom-Level Encoding ---
+        # Decode the top-level quantized map to provide context for the bottom level.
+        dec_t = self.dec_t(quant_t) # Shape: [B, C_emb, H/4, W/4]
+        # Concatenate the decoded top features with the original bottom features along the channel axis.
+        enc_b = torch.cat([dec_t, enc_b], 1) # Shape: [B, C_emb + C, H/4, W/4]
 
-        # Prepare for bottom-level quantization.
-        quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1)
-        # Bottom-level quantization.
-        quant_b, diff_b, id_b = self.quantize_b(quant_b)
-        # Permute back to (B, C, H, W).
-        quant_b = quant_b.permute(0, 3, 1, 2)
+        # --- Bottom-Level Quantization ---
+        quant_b = self.quantize_conv_b(enc_b).permute(0, 2, 3, 1) # Shape: [B, H/4, W/4, C_emb]
+        quant_b, diff_b, id_b = self.quantize_b(quant_b) # quant_b shape: [B, H/4, W/4, C_emb]
+        quant_b = quant_b.permute(0, 3, 1, 2) # Shape: [B, C_emb, H/4, W/4]
         diff_b = diff_b.unsqueeze(0)
 
         return quant_t, quant_b, diff_t + diff_b, id_t, id_b
 
     def decode(self, quant_t, quant_b):
         """
-        Decodes the quantized representations to reconstruct the image.
+        Decodes the quantized latent representations from both levels into an image.
         Args:
-            quant_t (Tensor): The quantized top-level representation.
-            quant_b (Tensor): The quantized bottom-level representation.
+            quant_t (Tensor): Quantized top-level latent map, shape [B, C_emb, H/8, W/8].
+            quant_b (Tensor): Quantized bottom-level latent map, shape [B, C_emb, H/4, W/4].
         Returns:
-            dec (Tensor): The reconstructed image.
+            dec (Tensor): The reconstructed image, shape [B, C_in, H, W].
         """
-        # Upsample the top-level representation.
-        upsample_t = self.upsample_t(quant_t)
-        # Concatenate the upsampled top-level and the bottom-level representations.
-        quant = torch.cat([upsample_t, quant_b], 1)
-        # Decode the combined representation.
-        dec = self.dec(quant)
+        # Upsample the top-level latent map to match the bottom-level's spatial dimensions.
+        upsample_t = self.upsample_t(quant_t) # Shape: [B, C_emb, H/4, W/4]
+        # Concatenate the upsampled top and the bottom latent maps along the channel axis.
+        quant = torch.cat([upsample_t, quant_b], 1) # Shape: [B, C_emb + C_emb, H/4, W/4]
+        # Pass the combined latent map through the final decoder to reconstruct the image.
+        dec = self.dec(quant) # Shape: [B, C_in, H, W]
 
         return dec
 
     def decode_code(self, code_t, code_b):
         """
-        Decodes from discrete latent codes to an image.
-        This is useful for generating new images from learned codes.
+        Decodes from discrete latent codes (indices) to an image. Used for generation.
         Args:
-            code_t (Tensor): The top-level discrete codes.
-            code_b (Tensor): The bottom-level discrete codes.
+            code_t (Tensor): Top-level indices, shape [B, H/8, W/8].
+            code_b (Tensor): Bottom-level indices, shape [B, H/4, W/4].
         Returns:
-            dec (Tensor): The generated image.
+            dec (Tensor): The generated image, shape [B, C_in, H, W].
         """
-        # Get the embedding vectors for the top-level codes.
-        quant_t = self.quantize_t.embed_code(code_t)
-        quant_t = quant_t.permute(0, 3, 1, 2)
-        # Get the embedding vectors for the bottom-level codes.
-        quant_b = self.quantize_b.embed_code(code_b)
-        quant_b = quant_b.permute(0, 3, 1, 2)
+        # Look up the embedding vectors for the top-level codes.
+        quant_t = self.quantize_t.embed_code(code_t) # Shape: [B, H/8, W/8, C_emb]
+        quant_t = quant_t.permute(0, 3, 1, 2) # Shape: [B, C_emb, H/8, W/8]
+        # Look up the embedding vectors for the bottom-level codes.
+        quant_b = self.quantize_b.embed_code(code_b) # Shape: [B, H/4, W/4, C_emb]
+        quant_b = quant_b.permute(0, 3, 1, 2) # Shape: [B, C_emb, H/4, W/4]
 
-        # Decode the embedding vectors to an image.
+        # Use the standard decode method to generate the image from the looked-up vectors.
         dec = self.decode(quant_t, quant_b)
 
         return dec
